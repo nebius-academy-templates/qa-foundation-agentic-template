@@ -19,12 +19,13 @@ CHECK_NAMES = (
     "Scope alignment",
     "Deletion impact",
 )
+HUMAN_VERIFICATION = "Human verification"
 FINDING_RE = re.compile(
     r"^- (?P<check>"
-    + "|".join(re.escape(name) for name in CHECK_NAMES)
+    + "|".join(re.escape(name) for name in (*CHECK_NAMES, HUMAN_VERIFICATION))
     + r") `(?P<path>[^`]+):(?P<line>[1-9][0-9]*)` - "
     r"(?P<issue>.+); (?P<impact>.+); "
-    r"(?P<severity>blocker|request changes)$"
+    r"(?P<severity>blocker|request changes|human review required)$"
 )
 HUNK_RE = re.compile(
     r"^@@ -(?P<old>[0-9]+)(?:,[0-9]+)? "
@@ -51,7 +52,6 @@ class ModelReview:
     findings: tuple[Finding, ...] = ()
     unverified: str | None = None
     question: str | None = None
-    scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,20 +76,7 @@ def parse_model_review(text: str) -> ModelReview:
         raise ValueError("review does not start with Verdict")
 
     verdict = lines[0][len(verdict_prefix) :]
-    if verdict == "HUMAN REVIEW REQUIRED":
-        if len(lines) != 3 or not lines[1].startswith(summary_prefix):
-            raise ValueError("human-review output has the wrong structure")
-        if not lines[1][len(summary_prefix) :].strip():
-            raise ValueError("Summary is empty")
-        if not lines[2].startswith("Scope: ") or not lines[2][len("Scope: ") :].strip():
-            raise ValueError("Scope is empty")
-        return ModelReview(
-            verdict=verdict,
-            summary=lines[1][len(summary_prefix) :],
-            scope=lines[2][len("Scope: ") :],
-        )
-
-    if verdict not in {"APPROVE", "REQUEST CHANGES"}:
+    if verdict not in {"APPROVE", "REQUEST CHANGES", "HUMAN REVIEW REQUIRED"}:
         raise ValueError(f"unsupported verdict: {verdict}")
     if len(lines) < 2 or not lines[1].startswith(summary_prefix) or not lines[1][len(summary_prefix) :].strip():
         raise ValueError("Summary is missing or empty")
@@ -108,25 +95,35 @@ def parse_model_review(text: str) -> ModelReview:
             raise ValueError("a no-finding review must recommend APPROVE")
         findings: tuple[Finding, ...] = ()
     else:
-        if verdict != "REQUEST CHANGES":
-            raise ValueError("a review with findings must recommend REQUEST CHANGES")
         parsed_findings = []
         for line in finding_lines:
             match = FINDING_RE.fullmatch(line)
             if match is None:
                 raise ValueError(f"finding has the wrong format: {line}")
-            parsed_findings.append(
-                Finding(
-                    check=match.group("check"),
-                    path=match.group("path"),
-                    line=int(match.group("line")),
-                    issue=match.group("issue"),
-                    impact=match.group("impact"),
-                    severity=match.group("severity"),
-                    raw=line,
-                )
+            finding = Finding(
+                check=match.group("check"),
+                path=match.group("path"),
+                line=int(match.group("line")),
+                issue=match.group("issue"),
+                impact=match.group("impact"),
+                severity=match.group("severity"),
+                raw=line,
             )
+            if (finding.check == HUMAN_VERIFICATION) != (
+                finding.severity == "human review required"
+            ):
+                raise ValueError("Human verification requires human review required severity")
+            parsed_findings.append(finding)
         findings = tuple(parsed_findings)
+        has_human_verification = any(
+            finding.check == HUMAN_VERIFICATION for finding in findings
+        )
+        if verdict == "APPROVE":
+            raise ValueError("a review with findings cannot recommend APPROVE")
+        if verdict == "REQUEST CHANGES" and has_human_verification:
+            raise ValueError("Human verification requires HUMAN REVIEW REQUIRED")
+        if verdict == "HUMAN REVIEW REQUIRED" and not has_human_verification:
+            raise ValueError("HUMAN REVIEW REQUIRED needs a Human verification finding")
 
     return ModelReview(
         verdict=verdict,
@@ -176,16 +173,9 @@ def _parse_diff_path(raw_path: str) -> str | None:
 
 def index_diff(
     diff_text: str,
-) -> tuple[
-    set[tuple[str, int]],
-    set[tuple[str, int]],
-    list[tuple[str, int]],
-    list[tuple[str, int]],
-]:
+) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
     right_lines: set[tuple[str, int]] = set()
     left_lines: set[tuple[str, int]] = set()
-    right_changes: list[tuple[str, int]] = []
-    left_changes: list[tuple[str, int]] = []
     old_path: str | None = None
     new_path: str | None = None
     old_line = 0
@@ -218,12 +208,10 @@ def index_diff(
         if prefix == "+":
             if new_path is not None:
                 right_lines.add((new_path, new_line))
-                right_changes.append((new_path, new_line))
             new_line += 1
         elif prefix == "-":
             if old_path is not None:
                 left_lines.add((old_path, old_line))
-                left_changes.append((old_path, old_line))
             old_line += 1
         elif prefix == " ":
             if new_path is not None:
@@ -235,7 +223,7 @@ def index_diff(
         else:
             in_hunk = False
 
-    return right_lines, left_lines, right_changes, left_changes
+    return right_lines, left_lines
 
 
 def _safe_repo_path(path: str) -> bool:
@@ -258,28 +246,6 @@ def _locate_finding(
     return None
 
 
-def _locate_scope(
-    scope: str,
-    right_changes: list[tuple[str, int]],
-    left_changes: list[tuple[str, int]],
-) -> tuple[str, int, str, str] | None:
-    scope_paths = tuple(
-        value.strip().strip("`").rstrip("/")
-        for value in scope.split(",")
-        if value.strip().strip("`").rstrip("/")
-    )
-    for scope_path in scope_paths:
-        if not _safe_repo_path(scope_path):
-            continue
-        for path, line in right_changes:
-            if path == scope_path or path.startswith(f"{scope_path}/"):
-                return path, line, "RIGHT", scope_path
-        for path, line in left_changes:
-            if path == scope_path or path.startswith(f"{scope_path}/"):
-                return path, line, "LEFT", scope_path
-    return None
-
-
 def _inline_body(finding: Finding, review_hash: str) -> str:
     return "\n".join(
         (
@@ -289,17 +255,6 @@ def _inline_body(finding: Finding, review_hash: str) -> str:
             finding.issue,
             "",
             f"Impact: {finding.impact}",
-        )
-    )
-
-
-def _scope_inline_body(scope_path: str, review_hash: str) -> str:
-    return "\n".join(
-        (
-            f"<!-- ai-pr-review-scope:v1 review={review_hash} -->",
-            "**Human review required**",
-            "",
-            f"This path is outside the automated review scope: `{scope_path}`.",
         )
     )
 
@@ -319,24 +274,21 @@ def _summary_body(
         f"Verdict: {review.verdict}",
         f"Summary: {review.summary}",
     ]
-    if review.scope is not None:
-        lines.append(f"Scope: {review.scope}")
-    else:
-        if not review.findings:
-            lines.append("Findings: none")
-        elif unplaced:
-            lines.append(
-                f"Findings: {placed_count} inline; {len(unplaced)} could not be attached and are listed below"
-            )
-        else:
-            suffix = "comment" if placed_count == 1 else "comments"
-            lines.append(f"Findings: {placed_count} inline {suffix}")
-        lines.extend(
-            (
-                f"Unverified: {review.unverified}",
-                f"Question: {review.question}",
-            )
+    if not review.findings:
+        lines.append("Findings: none")
+    elif unplaced:
+        lines.append(
+            f"Findings: {placed_count} inline; {len(unplaced)} could not be attached and are listed below"
         )
+    else:
+        suffix = "comment" if placed_count == 1 else "comments"
+        lines.append(f"Findings: {placed_count} inline {suffix}")
+    lines.extend(
+        (
+            f"Unverified: {review.unverified}",
+            f"Question: {review.question}",
+        )
+    )
     if unplaced:
         lines.extend(("", "Unplaced findings:", *(finding.raw for finding in unplaced)))
     lines.extend(("", footer))
@@ -360,25 +312,9 @@ def build_payload(review_text: str, diff_text: str, head_sha: str) -> dict[str, 
 
     assert final_review.model_review is not None
     assert final_review.footer is not None
-    right_lines, left_lines, right_changes, left_changes = index_diff(diff_text)
+    right_lines, left_lines = index_diff(diff_text)
     comments = []
     unplaced = []
-    if final_review.model_review.scope is not None:
-        scope_location = _locate_scope(
-            final_review.model_review.scope,
-            right_changes,
-            left_changes,
-        )
-        if scope_location is not None:
-            path, line, side, scope_path = scope_location
-            comments.append(
-                {
-                    "path": path,
-                    "line": line,
-                    "side": side,
-                    "body": _scope_inline_body(scope_path, review_hash),
-                }
-            )
     for finding in final_review.model_review.findings:
         side = _locate_finding(finding, right_lines, left_lines)
         if side is None:
