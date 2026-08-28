@@ -37,57 +37,6 @@ EOF
   commit_output
 }
 
-validate_model_review() {
-  local review_file="$1"
-  local finding_count
-  local finding_index
-  local finding_regex
-  local line
-  local line_count
-  local -a lines=()
-
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-    lines+=("$line")
-  done < "$review_file"
-
-  line_count=${#lines[@]}
-  (( line_count > 0 )) || return 1
-  [[ "${lines[*]}" != *'```'* ]] || return 1
-
-  case "${lines[0]}" in
-    "Verdict: HUMAN REVIEW REQUIRED")
-      (( line_count == 3 )) || return 1
-      [[ "${lines[1]}" =~ ^Summary:\ .+ ]] || return 1
-      [[ "${lines[2]}" =~ ^Scope:\ .+ ]] || return 1
-      ;;
-    "Verdict: APPROVE" | "Verdict: REQUEST CHANGES")
-      (( line_count >= 6 && line_count <= 8 )) || return 1
-      [[ "${lines[1]}" =~ ^Summary:\ .+ ]] || return 1
-      [[ "${lines[2]}" == "Findings:" ]] || return 1
-      [[ "${lines[line_count - 2]}" =~ ^Unverified:\ (none|.+\ -\ missing\ evidence)$ ]] || return 1
-      [[ "${lines[line_count - 1]}" =~ ^Question:\ (none|.+)$ ]] || return 1
-
-      finding_count=$((line_count - 5))
-      if [[ "${lines[3]}" == "- none" ]]; then
-        (( finding_count == 1 )) || return 1
-        [[ "${lines[0]}" == "Verdict: APPROVE" ]] || return 1
-        return 0
-      fi
-
-      [[ "${lines[0]}" == "Verdict: REQUEST CHANGES" ]] || return 1
-      finding_regex='^- (Claim accuracy|Assertion strength|Test reliability|Scope alignment|Deletion impact) `[^`]+:[1-9][0-9]*` - .+; .+; (blocker|request changes)$'
-      for ((finding_index = 3; finding_index < line_count - 2; finding_index++)); do
-        [[ "${lines[finding_index]}" =~ $finding_regex ]] || return 1
-      done
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 handle_unexpected_error() {
   local exit_code=$?
   trap - ERR
@@ -228,7 +177,8 @@ if ! jq -er \
   exit 0
 fi
 
-if ! validate_model_review "$model_review_file"; then
+if ! python3 .github/scripts/build_ai_review_payload.py \
+  validate --model-review "$model_review_file"; then
   write_human_review_fallback "The provider response did not match the required review format."
   exit 0
 fi
