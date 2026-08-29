@@ -1,0 +1,205 @@
+name: Repository code review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+concurrency:
+  group: repository-code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MODEL_ID: claude-sonnet-5
+  MODEL_EFFORT: high
+  MAX_DIFF_BYTES: "120000"
+  MAX_AGENT_TURNS: "50"
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      !contains(github.event.pull_request.title, '[skip-ai-review]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Check out the trusted base repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the untrusted PR head for read-only inspection
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare the review context and schema
+        id: context
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MAX_DIFF_BYTES: ${{ env.MAX_DIFF_BYTES }}
+          PR_DIFF_FILE: ${{ runner.temp }}/repository-code-review.diff
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REVIEW_OUTPUT_FILE: ${{ runner.temp }}/repository-code-review-report.md
+        run: |
+          rm -f -- "$PR_DIFF_FILE"
+          rm -f -- "$REVIEW_OUTPUT_FILE"
+          rm -rf -- .review-context
+          mkdir .review-context
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          git diff --no-ext-diff --no-textconv "$BASE_SHA...$HEAD_SHA" > "$PR_DIFF_FILE"
+          cp -- "$PR_DIFF_FILE" .review-context/pr.diff
+          jq -n \
+            --arg title "$PR_TITLE" \
+            --arg body "$PR_BODY" \
+            '{title: $title, description: $body}' \
+            > .review-context/pr-metadata.json
+
+          diff_bytes="$(wc -c < "$PR_DIFF_FILE" | tr -d '[:space:]')"
+          if (( diff_bytes > MAX_DIFF_BYTES )); then
+            cat > "$REVIEW_OUTPUT_FILE" <<EOF
+          ## Repository code review unavailable
+
+          The complete diff is ${diff_bytes} bytes, which exceeds the configured ${MAX_DIFF_BYTES}-byte input budget. No partial review was produced.
+
+          Human review is required.
+          EOF
+            echo "run_agent=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_agent=true" >> "$GITHUB_OUTPUT"
+            python3 .github/scripts/build_ai_review_payload.py quote-schema \
+              --schema .github/scripts/repository-code-review-output-schema.json \
+              >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate the repository-aware code review draft
+        id: generate
+        continue-on-error: true
+        if: ${{ steps.context.outputs.run_agent == 'true' }}
+        timeout-minutes: 15
+        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10 # v1.0.210
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          display_report: false
+          include_fix_links: false
+          show_full_output: false
+          prompt: |
+            The workspace root is the trusted base revision. The untrusted pull
+            request head is in pr-head/. Read .review-context/pr.diff and
+            .review-context/pr-metadata.json, inspect related repository files, and
+            follow review_template.md and AGENTS.md. Do not run code or tests, modify
+            files, or use GitHub tools to publish anything. Complete every delegated
+            repository-reading pass before returning. Return only the structured
+            result required by the supplied JSON schema; set complete to false if
+            any required pass is unfinished. The workflow validates and publishes
+            the result separately.
+          claude_args: |
+            --agent repository-code-review-agent
+            --model ${{ env.MODEL_ID }}
+            --effort ${{ env.MODEL_EFFORT }}
+            --max-turns ${{ env.MAX_AGENT_TURNS }}
+            --add-dir pr-head
+            --tools "Read,Grep,Glob,Agent,StructuredOutput"
+            --allowedTools "Read,Grep,Glob,Agent,StructuredOutput"
+            --disallowedTools "mcp__*"
+            --json-schema ${{ steps.context.outputs.shell }}
+
+      - name: Validate and prepare the review
+        id: finalize
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        env:
+          AGENT_EXPECTED: ${{ steps.context.outputs.run_agent || 'unknown' }}
+          AGENT_OUTCOME: ${{ steps.generate.outcome || 'unknown' }}
+          EXECUTION_FILE: ${{ steps.generate.outputs.execution_file }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_DIFF_FILE: ${{ runner.temp }}/repository-code-review.diff
+          REVIEW_OUTPUT_FILE: ${{ runner.temp }}/repository-code-review-report.md
+          REVIEW_PAYLOAD_FILE: ${{ runner.temp }}/repository-code-review-payload.json
+          STRUCTURED_OUTPUT: ${{ steps.generate.outputs.structured_output }}
+        run: |
+          rm -f -- "$REVIEW_PAYLOAD_FILE"
+          python3 .github/scripts/build_ai_review_payload.py finalize \
+            --agent-expected "$AGENT_EXPECTED" \
+            --agent-outcome "$AGENT_OUTCOME" \
+            --structured-json "$STRUCTURED_OUTPUT" \
+            --execution-file "$EXECUTION_FILE" \
+            --existing-report "$REVIEW_OUTPUT_FILE" \
+            --diff "$PR_DIFF_FILE" \
+            --head-sha "$HEAD_SHA" \
+            --report-output "$REVIEW_OUTPUT_FILE" \
+          --payload-output "$REVIEW_PAYLOAD_FILE" \
+          --summary-output "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the Markdown report
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: repository-code-review-report-pr-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/repository-code-review-report.md
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish the non-blocking review
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_PAYLOAD_FILE: ${{ runner.temp }}/repository-code-review-payload.json
+        run: |
+          if [[ ! -s "$REVIEW_PAYLOAD_FILE" ]]; then
+            body="$(printf '<!-- repository-code-review:v2 head=%s review=fallback -->\n## Repository code review unavailable\n\nNo complete review payload was produced. Human review is required.' "$HEAD_SHA")"
+            jq -n \
+              --arg commit_id "$HEAD_SHA" \
+              --arg body "$body" \
+              '{commit_id: $commit_id, body: $body, event: "COMMENT", comments: []}' \
+              > "$REVIEW_PAYLOAD_FILE"
+            printf '%s\n' "$body" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          reviews_file="$(mktemp "$RUNNER_TEMP/repository-code-reviews.XXXXXX")"
+          trap 'rm -f -- "$reviews_file"' EXIT
+
+          marker="$(
+            jq -er \
+              '.body | capture("(?<marker><!-- repository-code-review:v2 [^>]+ -->)").marker' \
+              "$REVIEW_PAYLOAD_FILE"
+          )"
+          gh api --paginate \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+            > "$reviews_file"
+          existing_review_id="$(
+            jq -sr --arg marker "$marker" \
+              '[.[][]? | select(.user.login == "github-actions[bot]" and ((.body // "") | contains($marker))) | .id] | last // empty' \
+              "$reviews_file"
+          )"
+
+          if [[ -n "$existing_review_id" ]]; then
+            echo "Repository code review ${existing_review_id} already contains this exact result." >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh api --method POST --silent \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+              --input "$REVIEW_PAYLOAD_FILE"
+          fi
