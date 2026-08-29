@@ -4,7 +4,7 @@
   "required": [
     "complete",
     "summary",
-    "description",
+    "recommendation",
     "findings",
     "unverified",
     "question"
@@ -26,11 +26,11 @@
         "pattern": "^[^\\r\\n]+$"
       }
     },
-    "description": {
+    "recommendation": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 500,
-      "description": "One to three short sentences for the person deciding whether to merge that state what to do and the material product, test, or CI behavior that justifies it.",
+      "maxLength": 1000,
+      "description": "One to five short sentences telling the person who decides on the merge what to do and which product, test, or CI behavior makes it necessary.",
       "pattern": "^[^\\r\\n]+$"
     },
     "findings": {
@@ -66,7 +66,7 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 500,
-            "pattern": "^[^`\\r\\n]+$"
+            "pattern": "^[^/`\\\\\\r\\n][^`\\\\\\r\\n]*$"
           },
           "line": {
             "type": "integer",

@@ -2,159 +2,152 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
-import sys
-import unicodedata
 from dataclasses import dataclass
-from pathlib import Path
 
 
-SECRET_RE = re.compile(
-    r"(?:sk-ant-[A-Za-z0-9_-]+|ghs_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)",
-    re.IGNORECASE,
+ERROR_RESULT_SUBTYPES = frozenset(
+    {
+        "error_during_execution",
+        "error_max_turns",
+        "error_max_budget_usd",
+        "error_max_structured_output_retries",
+    }
 )
+PUBLIC_REASONS = {
+    "authentication": (
+        "Provider authentication failed. Verify the `ANTHROPIC_API_KEY` "
+        "repository secret."
+    ),
+    "rate_limit": (
+        "The provider rate limit was exceeded. Retry after the limit resets."
+    ),
+    "overloaded": "The provider reported temporary overload. Retry the workflow.",
+    "timeout": "Claude Code execution timed out before completing the review.",
+    "unknown": (
+        "Claude Code Action failed before producing a complete review. "
+        "See the Actions log for the diagnostic category."
+    ),
+}
+STATUS_CATEGORIES = {
+    401: "authentication",
+    429: "rate_limit",
+    529: "overloaded",
+}
+MESSAGE_CATEGORIES = (
+    (
+        re.compile(
+            r"authentication[_ -]?error|unauthorized|"
+            r"invalid.{0,30}(?:api|x-api)[_ -]?key",
+            re.IGNORECASE,
+        ),
+        "authentication",
+    ),
+    (re.compile(r"rate[_ -]?limit|too many requests", re.IGNORECASE), "rate_limit"),
+    (re.compile(r"overload|capacity", re.IGNORECASE), "overloaded"),
+    (re.compile(r"timed? out|timeout|deadline exceeded", re.IGNORECASE), "timeout"),
+)
+
+ExecutionRecord = dict[str, object]
 
 
 @dataclass(frozen=True)
 class ProviderDiagnostic:
-    category: str
     public_reason: str
     log_line: str
 
 
-def _error_fragments(value: object) -> list[str]:
-    fragments: list[str] = []
-
-    def visit(node: object, inside_error: bool = False) -> None:
-        if isinstance(node, list):
-            for item in node:
-                visit(item, inside_error)
-            return
-        if not isinstance(node, dict):
-            if inside_error and isinstance(node, str):
-                fragments.append(node)
-            return
-
-        record_type = str(node.get("type", "")).lower()
-        subtype = str(node.get("subtype", "")).lower()
-        is_error = (
-            inside_error
-            or node.get("is_error") is True
-            or record_type == "error"
-            or "error" in subtype
-            or "error" in node
-            or "errors" in node
-        )
-        for child in node.values():
-            visit(child, is_error)
-
-    visit(value)
-    return fragments
+@dataclass(frozen=True)
+class ExecutionError:
+    subtype: str
+    status: int | None
+    message: str
 
 
-def _parse_execution_log(text: str) -> object:
+def _parse_execution_log(text: str) -> list[ExecutionRecord]:
     try:
-        return json.loads(text)
+        value = json.loads(text)
     except json.JSONDecodeError:
-        records = []
-        for line in text.splitlines():
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return records
+        return []
+    if not isinstance(value, list):
+        return []
+    return [record for record in value if isinstance(record, dict)]
 
 
-def _safe_detail(fragments: list[str]) -> str:
-    if not fragments:
-        return "no structured provider error was available"
-    printable = " ".join(fragments)
-    printable = "".join(
-        character if not unicodedata.category(character).startswith("C") else " "
-        for character in printable
+def _first_string(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return next(
+            (
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            ),
+            "",
+        )
+    return ""
+
+
+def _execution_error(records: list[ExecutionRecord]) -> ExecutionError | None:
+    record = next(
+        (record for record in reversed(records) if record.get("type") == "result"),
+        None,
     )
-    single_line = " ".join(printable.split())
-    redacted = SECRET_RE.sub("[redacted-secret]", single_line)
-    if len(redacted) > 500:
-        return f"{redacted[:497]}..."
-    return redacted
+    if record is None:
+        return None
+
+    subtype = record.get("subtype")
+    if not isinstance(subtype, str):
+        return None
+    if subtype == "success":
+        if record.get("is_error") is not True:
+            return None
+        message = _first_string(record.get("result"))
+    elif subtype in ERROR_RESULT_SUBTYPES:
+        message = _first_string(record.get("errors"))
+    else:
+        return None
+
+    raw_status = record.get("api_error_status")
+    status = (
+        raw_status
+        if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+        else None
+    )
+    return ExecutionError(subtype=subtype, status=status, message=message)
+
+
+def _classify(error: ExecutionError | None) -> str:
+    if error is None:
+        return "unknown"
+    if error.status in STATUS_CATEGORIES:
+        return STATUS_CATEGORIES[error.status]
+    return next(
+        (
+            category
+            for pattern, category in MESSAGE_CATEGORIES
+            if pattern.search(error.message)
+        ),
+        "unknown",
+    )
 
 
 def describe_execution_error(execution_text: str) -> ProviderDiagnostic:
-    fragments = _error_fragments(_parse_execution_log(execution_text))
-    evidence = " ".join(fragments).lower()
-
-    if re.search(
-        r"authentication[_ -]?error|unauthorized|invalid.{0,30}(?:api|x-api)[_ -]?key|\b401\b",
-        evidence,
-    ):
-        category = "authentication"
-        public_reason = (
-            "Provider authentication failed. Verify the `ANTHROPIC_API_KEY` "
-            "repository secret."
-        )
-    elif re.search(r"rate[_ -]?limit|too many requests|\b429\b", evidence):
-        category = "rate_limit"
-        public_reason = (
-            "The provider rate limit was exceeded. Retry after the limit resets."
-        )
-    elif re.search(r"overload|capacity|\b529\b", evidence):
-        category = "overloaded"
-        public_reason = "The provider reported temporary overload. Retry the workflow."
-    elif re.search(r"timed? out|timeout|deadline exceeded", evidence):
-        category = "timeout"
-        public_reason = "Claude Code execution timed out before completing the review."
-    else:
-        category = "unknown"
-        public_reason = (
-            "Claude Code Action failed before producing a complete review. "
-            "See the Actions log for the diagnostic category."
-        )
+    error = _execution_error(_parse_execution_log(execution_text))
+    category = _classify(error)
+    subtype = error.subtype if error is not None else "unavailable"
+    status = (
+        error.status
+        if error is not None and error.status is not None
+        else "unavailable"
+    )
 
     return ProviderDiagnostic(
-        category=category,
-        public_reason=public_reason,
+        public_reason=PUBLIC_REASONS[category],
         log_line=(
             "Repository code review provider diagnostic: "
-            f"category={category} detail={_safe_detail(fragments)}"
+            f"category={category} subtype={subtype} status={status}"
         ),
     )
-
-
-def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Extract a safe provider diagnostic from Claude Code execution output."
-    )
-    parser.add_argument("--execution-file", default="")
-    parser.add_argument("--output", required=True, type=Path)
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
-    execution_text = ""
-    if args.execution_file:
-        try:
-            execution_text = Path(args.execution_file).read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError:
-            pass
-
-    diagnostic = describe_execution_error(execution_text)
-    try:
-        output_temp = args.output.with_name(f".{args.output.name}.tmp")
-        output_temp.write_text(diagnostic.public_reason + "\n", encoding="utf-8")
-        output_temp.replace(args.output)
-    except OSError as error:
-        print(f"Provider diagnostic output error: {error}", file=sys.stderr)
-        return 1
-
-    print(diagnostic.log_line, file=sys.stderr)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

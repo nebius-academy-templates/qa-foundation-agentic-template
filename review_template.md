@@ -100,11 +100,11 @@ repository evidence cannot provide.
 - Write `summary` as one to 10 bullets. Each bullet states one material change
   introduced by the pull request. Do not compress unrelated functionality into
   one sentence or use a parenthesized inventory of files and components.
-- Write `description` as one to three short sentences for the person deciding
-  whether to merge. State what that person should do and the material product,
-  test, or CI behavior that justifies it. For multiple findings, distinguish
-  work required before merge from follow-up work. If there are no findings,
-  state that no reviewed issue prevents merge.
+- Write `recommendation` as one to five short sentences telling the person who
+  decides on the merge what to do and which product, test, or CI behavior makes
+  it necessary. For multiple findings, distinguish work required before merge
+  from follow-up work. If there are no findings, state that no reviewed issue
+  prevents merge.
 - Keep every structured string value concise and single-line. Do not quote policy
   or add prose outside the structured fields or a code fence.
 - Do not use emoji or emoji-style pictographic symbols anywhere in the output.
@@ -119,7 +119,7 @@ them from the validated findings and the severity table above.
 
 Return `summary` as an array of one to 10 concise technical-documentation
 items. The workflow renders each item as a Markdown bullet. Return
-`description` as the single-paragraph merge recommendation rendered in the
+`recommendation` as the single-paragraph merge recommendation rendered in the
 top-level review body without a field label.
 
 The workflow derives `Approve` when findings are empty, `Human review required`
