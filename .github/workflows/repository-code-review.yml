@@ -39,13 +39,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch the PR head commit
-        env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          git fetch --no-tags origin "$HEAD_SHA"
-          git cat-file -e "${HEAD_SHA}^{commit}"
-
       - name: Check out the untrusted PR head for read-only inspection
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
