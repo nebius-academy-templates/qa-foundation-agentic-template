@@ -39,6 +39,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Fetch the PR head commit
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags origin "$HEAD_SHA"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
       - name: Check out the untrusted PR head for read-only inspection
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,8 +109,11 @@ jobs:
           include_fix_links: false
           show_full_output: false
           prompt: |
-            The workspace root is the trusted base revision. The untrusted pull
-            request head is in pr-head/. Read .review-context/pr.diff and
+            The workspace root contains the trusted base revision and trusted review
+            instructions. The proposed repository state is in pr-head/. Use files
+            from pr-head/ when evaluating the resulting code and use the workspace
+            root only for trusted workflow instructions and comparison with the base
+            revision. Read .review-context/pr.diff and
             .review-context/pr-metadata.json, inspect related repository files, and
             follow review_template.md and AGENTS.md. Do not run code or tests, modify
             files, or use GitHub tools to publish anything. Complete every delegated
@@ -146,8 +156,8 @@ jobs:
             --diff "$PR_DIFF_FILE" \
             --head-sha "$HEAD_SHA" \
             --report-output "$REVIEW_OUTPUT_FILE" \
-          --payload-output "$REVIEW_PAYLOAD_FILE" \
-          --summary-output "$GITHUB_STEP_SUMMARY"
+            --payload-output "$REVIEW_PAYLOAD_FILE" \
+            --summary-output "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the Markdown report
         if: ${{ !cancelled() }}
@@ -159,7 +169,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Publish the non-blocking review
+      - name: Publish the repository review
         if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}

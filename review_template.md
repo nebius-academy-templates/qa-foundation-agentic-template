@@ -132,13 +132,13 @@ The published Markdown has this form:
 ```text
 Review recommendation: Request changes
 
-Restore API-suite gating before merge because the changed step no longer fails the build when API regressions occur.
+Restore the exact order-history assertion before merge because the changed test no longer verifies the dates and routes named by the scenario.
 
 Summary:
-- Makes the fake-API and API-suite CI step non-blocking.
-- Preserves subsequent CI steps after an API-suite failure.
+- Replaces exact seeded-order verification with a non-empty-list assertion.
+
 Findings:
-- Correctness `.github/workflows/ci.yml:47` - The API suite step no longer fails the build; API regressions can reach main without a failing check; remove `continue-on-error` so API failures gate the build; blocker
+- Assertion strength `api-tests/src/test/kotlin/tests/OrderHistoryApiTest.kt:51` - The presence-only assertion no longer verifies dates or routes; incorrect order-history data can pass; restore exact field and order checks; blocker
 ```
 
 In structured output, `unverified` must be exactly `none` or
