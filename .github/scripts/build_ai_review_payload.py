@@ -15,7 +15,12 @@ from describe_ai_provider_error import describe_execution_error
 
 
 HUMAN_VERIFICATION = "Human verification"
+RECOMMENDATION_MAX_LENGTH = 1000
+SUMMARY_ITEM_MAX_LENGTH = 250
 FINDING_TEXT_MAX_LENGTH = 250
+FINDING_PATH_MAX_LENGTH = 500
+QUESTION_MAX_LENGTH = 500
+UNVERIFIED_MAX_LENGTH = 1000
 MAX_FINDINGS = 10
 MAX_SUMMARY_ITEMS = 10
 CHECK_SEVERITIES = {
@@ -46,7 +51,7 @@ EMOJI_RE = re.compile(
 STRUCTURED_KEYS = {
     "complete",
     "summary",
-    "description",
+    "recommendation",
     "findings",
     "unverified",
     "question",
@@ -59,6 +64,8 @@ FINDING_KEYS = {
     "impact",
     "required_change",
 }
+
+
 @dataclass(frozen=True)
 class Finding:
     check: str
@@ -74,7 +81,7 @@ class Finding:
 class ModelReview:
     verdict: str
     summary: tuple[str, ...]
-    description: str
+    recommendation: str
     findings: tuple[Finding, ...]
     unverified: str
     question: str
@@ -147,16 +154,26 @@ def parse_structured_review(payload: object) -> ModelReview:
             f"summary must contain between 1 and {MAX_SUMMARY_ITEMS} items"
         )
     summary = tuple(
-        _structured_line(item, "summary item", max_length=250)
+        _structured_line(item, "summary item", max_length=SUMMARY_ITEM_MAX_LENGTH)
         for item in raw_summary
     )
-    description = _structured_line(
-        payload["description"], "description", max_length=500
+    recommendation = _structured_line(
+        payload["recommendation"],
+        "recommendation",
+        max_length=RECOMMENDATION_MAX_LENGTH,
     )
-    unverified = _structured_line(payload["unverified"], "unverified")
+    unverified = _structured_line(
+        payload["unverified"],
+        "unverified",
+        max_length=UNVERIFIED_MAX_LENGTH,
+    )
     if unverified != "none" and re.fullmatch(r".+ - missing evidence", unverified) is None:
         raise ReviewValidationError("unverified has the wrong format")
-    question = _structured_line(payload["question"], "question", max_length=500)
+    question = _structured_line(
+        payload["question"],
+        "question",
+        max_length=QUESTION_MAX_LENGTH,
+    )
 
     raw_findings = payload["findings"]
     if not isinstance(raw_findings, list) or len(raw_findings) > MAX_FINDINGS:
@@ -171,7 +188,11 @@ def parse_structured_review(payload: object) -> ModelReview:
         check = _structured_line(raw_finding["check"], "finding check")
         if check not in SUPPORTED_CHECKS:
             raise ReviewValidationError("finding check is unsupported")
-        path = _structured_line(raw_finding["path"], "finding path", max_length=500)
+        path = _structured_line(
+            raw_finding["path"],
+            "finding path",
+            max_length=FINDING_PATH_MAX_LENGTH,
+        )
         if "`" in path or not _safe_repo_path(path):
             raise ReviewValidationError("finding path is unsafe")
         line = raw_finding["line"]
@@ -210,7 +231,7 @@ def parse_structured_review(payload: object) -> ModelReview:
     return ModelReview(
         verdict=derive_verdict(parsed_findings),
         summary=summary,
-        description=description,
+        recommendation=recommendation,
         findings=parsed_findings,
         unverified=unverified,
         question=question,
@@ -233,21 +254,29 @@ def _optional_review_lines(review: ModelReview) -> tuple[str, ...]:
     return tuple(lines)
 
 
+def _review_header(review: ModelReview) -> tuple[str, ...]:
+    return (
+        f"Review recommendation: {review.verdict}",
+        "",
+        review.recommendation,
+        "",
+        "Summary:",
+        *(f"- {item}" for item in review.summary),
+    )
+
+
 def render_model_review(review: ModelReview) -> str:
     finding_lines = tuple(render_finding(finding) for finding in review.findings)
-    return "\n".join(
-        (
-            f"Review recommendation: {review.verdict}",
-            "",
-            review.description,
-            "",
-            "Summary:",
-            *(f"- {item}" for item in review.summary),
-            "Findings:",
-            *(finding_lines or ("- none",)),
-            *_optional_review_lines(review),
-        )
-    )
+    lines = [
+        *_review_header(review),
+        "",
+        "Findings:",
+        *(finding_lines or ("- none",)),
+    ]
+    optional_lines = _optional_review_lines(review)
+    if optional_lines:
+        lines.extend(("", *optional_lines))
+    return "\n".join(lines)
 
 
 def render_published_review(review: ModelReview) -> str:
@@ -374,12 +403,8 @@ def _summary_body(
         f"<!-- repository-code-review:v2 head={head_sha} review={review_hash} -->",
         "## Repository code review",
         "",
-        f"Review recommendation: {review.verdict}",
+        *_review_header(review),
         "",
-        review.description,
-        "",
-        "Summary:",
-        *(f"- {item}" for item in review.summary),
     ]
     if not review.findings:
         lines.append("Findings: none")
@@ -401,7 +426,9 @@ def _summary_body(
     else:
         suffix = "comment" if inline_comment_count == 1 else "comments"
         lines.append(f"Findings: {inline_comment_count} inline {suffix}")
-    lines.extend(_optional_review_lines(review))
+    optional_lines = _optional_review_lines(review)
+    if optional_lines:
+        lines.extend(("", *optional_lines))
     if unplaced:
         lines.extend(("", "Unplaced findings:", *(render_finding(item) for item in unplaced)))
     return "\n".join(lines)
@@ -466,7 +493,7 @@ def _fallback_report(reason: str) -> str:
 def build_fallback_payload(report: str, head_sha: str) -> dict[str, object]:
     stripped = report.strip()
     if not stripped.startswith("## Repository code review unavailable"):
-        raise ValueError("fallback report has the wrong heading")
+        raise ReviewValidationError("fallback report has the wrong heading")
     report_hash = hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:16]
     safe_head = head_sha if SHA_RE.fullmatch(head_sha) else "unavailable"
     body = "\n".join(
@@ -483,6 +510,18 @@ def build_fallback_payload(report: str, head_sha: str) -> dict[str, object]:
     if safe_head != "unavailable":
         payload["commit_id"] = head_sha
     return payload
+
+
+def _invalid_structured_output(diagnostic_detail: str) -> tuple[str, str]:
+    diagnostic = (
+        "Repository code review validator diagnostic: "
+        f"{diagnostic_detail}"
+    )
+    report = _fallback_report(
+        "The provider response did not match the required review format. "
+        "See the Actions log for the validator diagnostic."
+    )
+    return diagnostic, report
 
 
 def finalize_review(
@@ -541,13 +580,8 @@ def finalize_review(
             review = parse_structured_review(json.loads(structured_output))
             report = render_published_review(review)
         except json.JSONDecodeError:
-            diagnostic = (
-                "Repository code review validator diagnostic: "
+            diagnostic, report = _invalid_structured_output(
                 "structured output is not valid JSON"
-            )
-            report = _fallback_report(
-                "The provider response did not match the required review format. "
-                "See the Actions log for the validator diagnostic."
             )
         except IncompleteReviewError as error:
             diagnostic = (
@@ -559,13 +593,8 @@ def finalize_review(
                 "passes, so no review was published."
             )
         except ValueError as error:
-            diagnostic = (
-                "Repository code review validator diagnostic: "
-                f"{public_validation_error(error)}"
-            )
-            report = _fallback_report(
-                "The provider response did not match the required review format. "
-                "See the Actions log for the validator diagnostic."
+            diagnostic, report = _invalid_structured_output(
+                public_validation_error(error)
             )
 
     if review is None:

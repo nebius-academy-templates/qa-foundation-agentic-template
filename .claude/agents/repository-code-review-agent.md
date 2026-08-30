@@ -86,6 +86,5 @@ calling `StructuredOutput` exactly once with the final review. Do not finish wit
 prose response. Write every schema field in factual, neutral technical-documentation
 style. Return one summary item per material change introduced by the pull request.
 Do not use emoji or emoji-style pictographic symbols in any schema field. Write
-`description` as one to three short sentences for the person deciding whether to
-merge. State what that person should do and the material product, test, or CI
-behavior that justifies it.
+`recommendation` as one to five short sentences telling the person who decides on
+the merge what to do and which product, test, or CI behavior makes it necessary.
