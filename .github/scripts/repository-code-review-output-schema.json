@@ -1,0 +1,112 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "complete",
+    "summary",
+    "recommendation",
+    "findings",
+    "unverified",
+    "question"
+  ],
+  "properties": {
+    "complete": {
+      "type": "boolean",
+      "description": "True only after every required repository-reading pass has completed and its result has been consolidated."
+    },
+    "summary": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "description": "Technical-documentation summary with one material change introduced by the pull request per bullet.",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 250,
+        "pattern": "^[^\\r\\n]+$"
+      }
+    },
+    "recommendation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "description": "One to five short sentences telling the person who decides on the merge what to do and which product, test, or CI behavior makes it necessary.",
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "check",
+          "path",
+          "line",
+          "issue",
+          "impact",
+          "required_change"
+        ],
+        "properties": {
+          "check": {
+            "type": "string",
+            "enum": [
+              "Correctness",
+              "Security",
+              "Claim accuracy",
+              "Assertion strength",
+              "Test reliability",
+              "Scope alignment",
+              "Deletion impact",
+              "Repository policy",
+              "Human verification"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "^[^/`\\\\\\r\\n][^`\\\\\\r\\n]*$"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "issue": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 250,
+            "description": "One concise, factual technical statement using the strongest rationale without repeating evidence or asking a rhetorical question.",
+            "pattern": "^[^;\\r\\n]+$"
+          },
+          "impact": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 250,
+            "description": "One concise, factual technical consequence of the changed behavior.",
+            "pattern": "^[^;\\r\\n]+$"
+          },
+          "required_change": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 250,
+            "description": "One specific technical action required to resolve the finding, written as a direct imperative.",
+            "pattern": "^[^;\\r\\n]+$"
+          }
+        }
+      }
+    },
+    "unverified": {
+      "type": "string",
+      "maxLength": 1000,
+      "description": "One factual evidence gap in technical-documentation style, or none.",
+      "pattern": "^(none|[^\\r\\n]+ - missing evidence)$"
+    },
+    "question": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "One direct material technical question whose answer may change the review outcome, or none; do not use conversational phrasing.",
+      "pattern": "^(none|[^\\r\\n]+)$"
+    }
+  }
+}
